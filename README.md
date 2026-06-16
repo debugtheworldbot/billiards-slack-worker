@@ -63,6 +63,17 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 The old local launchd jobs have been unloaded to avoid duplicate Slack posts.
 
+## Idempotency
+
+Scheduled sends are guarded by a Durable Object:
+
+- `reservation:YYYY-MM-DD`
+- `battle-report:YYYY-MM-DD`
+
+If Cloudflare invokes the same cron more than once, the second invocation skips
+the Slack post. Manual `/send/...` endpoints intentionally bypass this guard so
+they can still be used for testing.
+
 ## Deploy
 
 ```bash

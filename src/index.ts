@@ -3,6 +3,7 @@ type Env = {
   SLACK_CHANNEL_ID: string;
   STATE_URL: string;
   ADMIN_TOKEN?: string;
+  IDEMPOTENCY: DurableObjectNamespace;
 };
 
 type Player = {
@@ -49,6 +50,11 @@ type TimelineEntry = MatchRecord & {
   loserDelta: number;
   winnerRatingAfter: number;
   loserRatingAfter: number;
+};
+
+type IdempotencyReserveResponse = {
+  reserved: boolean;
+  reason?: string;
 };
 
 const RESERVATION_CRON = "0 9 * * 2-6";
@@ -125,22 +131,79 @@ export default {
   },
 };
 
+export class IdempotencyGate {
+  constructor(private state: DurableObjectState) {}
+
+  async fetch(request: Request) {
+    const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/reserve") {
+      const now = Date.now();
+      const pendingTimeoutMs = 15 * 60 * 1000;
+      const result = await this.state.storage.transaction(async (transaction) => {
+        const existing = await transaction.get<{
+          status: "pending" | "sent";
+          updatedAt: number;
+        }>("status");
+
+        if (existing?.status === "sent") {
+          return { reserved: false, reason: "already_sent" };
+        }
+
+        if (
+          existing?.status === "pending" &&
+          now - existing.updatedAt < pendingTimeoutMs
+        ) {
+          return { reserved: false, reason: "already_pending" };
+        }
+
+        await transaction.put("status", { status: "pending", updatedAt: now });
+        return { reserved: true };
+      });
+
+      return jsonResponse(result);
+    }
+
+    if (request.method === "POST" && url.pathname === "/complete") {
+      await this.state.storage.put("status", {
+        status: "sent",
+        updatedAt: Date.now(),
+      });
+      return jsonResponse({ ok: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/release") {
+      await this.state.storage.delete("status");
+      return jsonResponse({ ok: true });
+    }
+
+    return jsonResponse({ ok: false, error: "not_found" }, 404);
+  }
+}
+
 async function handleScheduled(cron: string, env: Env) {
   if (cron === RESERVATION_CRON) {
-    const message = await buildReservationMessage(env);
-    await postToSlack(env, message);
+    const dateSeed = shanghaiDateString();
+    const message = await buildReservationMessage(env, dateSeed);
+    await postToSlackOnce(env, `reservation:${dateSeed}`, message);
     return;
   }
 
   if (cron === BATTLE_REPORT_CRON) {
-    await sendBattleReport(env, { skipEmpty: true });
+    await sendBattleReport(env, {
+      skipEmpty: true,
+      idempotencyKey: `battle-report:${shanghaiDateString()}`,
+    });
     return;
   }
 
   console.log(`Unknown cron: ${cron}`);
 }
 
-async function sendBattleReport(env: Env, options: { skipEmpty: boolean }) {
+async function sendBattleReport(
+  env: Env,
+  options: { skipEmpty: boolean; idempotencyKey?: string },
+) {
   const state = await fetchState(env);
   const { message, matchCount } = buildBattleReportMessage(state, shanghaiDateString());
 
@@ -149,12 +212,13 @@ async function sendBattleReport(env: Env, options: { skipEmpty: boolean }) {
     return { skipped: true, matchCount };
   }
 
-  return postToSlack(env, message);
+  return options.idempotencyKey
+    ? postToSlackOnce(env, options.idempotencyKey, message)
+    : postToSlack(env, message);
 }
 
-async function buildReservationMessage(env: Env) {
+async function buildReservationMessage(env: Env, dateSeed = shanghaiDateString()) {
   const state = await fetchState(env);
-  const dateSeed = shanghaiDateString();
   const entries = buildReservationOrder(state.players || [], dateSeed);
 
   return [
@@ -166,6 +230,28 @@ async function buildReservationMessage(env: Env) {
         `${entry.order}. ${formatPlayerName(entry.name)} \`${entry.drawNumberLabel}\``,
     ),
   ].join("\n");
+}
+
+async function postToSlackOnce(env: Env, key: string, message: string) {
+  const gate = env.IDEMPOTENCY.get(env.IDEMPOTENCY.idFromName(key));
+  const reserve = await gate.fetch("https://idempotency.local/reserve", {
+    method: "POST",
+  });
+  const reserveData = await reserve.json<IdempotencyReserveResponse>();
+
+  if (!reserveData.reserved) {
+    console.log(`Skipped duplicate Slack post for ${key}: ${reserveData.reason}`);
+    return { skipped: true, key, reason: reserveData.reason };
+  }
+
+  try {
+    const result = await postToSlack(env, message);
+    await gate.fetch("https://idempotency.local/complete", { method: "POST" });
+    return result;
+  } catch (error) {
+    await gate.fetch("https://idempotency.local/release", { method: "POST" });
+    throw error;
+  }
 }
 
 async function fetchState(env: Env): Promise<AppState> {
