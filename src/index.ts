@@ -275,7 +275,7 @@ async function fetchBattleReport(env: Env, dateSeed: string): Promise<BattleRepo
     throw new Error(`GET ${url} returned invalid battle report`);
   }
 
-  return report;
+  return { ...report, message: mentionPlayerNames(report.message) };
 }
 
 async function handleSlackRecordMatch(
@@ -511,6 +511,22 @@ function fnv1a32(input: string) {
 function formatPlayerName(name: string) {
   const userId = PLAYER_SLACK_MENTIONS[name];
   return userId ? `${name} <@${userId}>` : name;
+}
+
+function mentionPlayerNames(message: string) {
+  return Object.keys(PLAYER_SLACK_MENTIONS)
+    .sort((left, right) => right.length - left.length)
+    .reduce((text, name) => {
+      const pattern = new RegExp(
+        `(^|[^A-Za-z0-9_@])(${escapeRegExp(name)})(?=$|[^A-Za-z0-9_])`,
+        "g",
+      );
+      return text.replace(pattern, `$1${formatPlayerName(name)}`);
+    }, message);
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function shanghaiDateString(date = new Date()) {
