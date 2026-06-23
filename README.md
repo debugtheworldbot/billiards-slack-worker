@@ -24,6 +24,7 @@ Required:
 
 ```bash
 npx wrangler secret put SLACK_BOT_TOKEN
+npx wrangler secret put SLACK_SIGNING_SECRET
 ```
 
 Optional but recommended for manual test endpoints:
@@ -62,6 +63,26 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 ```
 
 The old local launchd jobs have been unloaded to avoid duplicate Slack posts.
+
+## Slack Match Recording
+
+Create a Slack slash command pointing to:
+
+```text
+https://billiards-slack-notifier.istiancz.workers.dev/slack/record-match
+```
+
+Use it as:
+
+```text
+/record-match cwj gjj
+/record-match cwj 胜 gjj
+```
+
+The first player is recorded as winner and the second as loser. The Worker
+verifies Slack's request signature, resolves player names from `/api/state`,
+then writes the match to `/api/matches` with empty moments and notes.
+The command only works in the configured `SLACK_CHANNEL_ID`.
 
 ## Idempotency
 

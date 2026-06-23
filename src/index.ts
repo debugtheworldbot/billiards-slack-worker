@@ -1,6 +1,7 @@
 type Env = {
   SLACK_BOT_TOKEN: string;
   SLACK_CHANNEL_ID: string;
+  SLACK_SIGNING_SECRET?: string;
   STATE_URL: string;
   ADMIN_TOKEN?: string;
   IDEMPOTENCY: DurableObjectNamespace;
@@ -13,23 +14,8 @@ type Player = {
   isActive: boolean;
 };
 
-type MatchRecord = {
-  id: string;
-  winnerId: string;
-  loserId: string;
-  createdAt: string;
-  winnerMoments?: string[];
-  loserMoments?: string[];
-  winnerNote?: string;
-  loserNote?: string;
-};
-
 type AppState = {
-  players: Player[];
-  matches: MatchRecord[];
-  settings?: {
-    kFactor?: number;
-  };
+  players?: Player[];
 };
 
 type ReservationEntry = {
@@ -43,28 +29,23 @@ type ReservationEntry = {
   drawSeed: string;
 };
 
-type TimelineEntry = MatchRecord & {
-  winnerName: string;
-  loserName: string;
-  winnerDelta: number;
-  loserDelta: number;
-  winnerRatingAfter: number;
-  loserRatingAfter: number;
-};
-
 type IdempotencyReserveResponse = {
   reserved: boolean;
   reason?: string;
 };
 
+type BattleReport = {
+  matchCount: number;
+  message: string;
+};
+
+type ParsedMatchCommand = {
+  winner: string;
+  loser: string;
+};
+
 const RESERVATION_CRON = "0 9 * * 2-6";
 const BATTLE_REPORT_CRON = "30 11 * * 2-6";
-const DEFAULT_RATING = 1000;
-const DEFAULT_K_FACTOR = 100;
-const NEW_PLAYER_K_FACTOR = 150;
-const STABLE_PLAYER_K_FACTOR = 50;
-const NEW_PLAYER_GAME_THRESHOLD = 10;
-const STABLE_PLAYER_GAME_THRESHOLD = 30;
 
 const SPECIAL_DATE_SEEDS: Record<string, string> = {
   "2026-06-01": "reset-6",
@@ -83,16 +64,18 @@ const PLAYER_SLACK_MENTIONS: Record<string, string> = {
   Sinyu: "UL46YT8LA",
 };
 
-const MOMENT_LABELS: Record<string, string> = {
-  clearance_runout: "一杆清台",
-  shutout: "零封对手",
-  win_by_3: "胜对手3球",
-  win_by_5: "胜对手5球",
-  comeback_win: "逆转翻盘",
-  hill_hill_finish: "决胜局绝杀",
-  scratch_black_8: "误进黑八",
-  double_scratch: "连续白球失误",
-  hill_hill_meltdown: "决胜局断电",
+const PLAYER_ALIASES: Record<string, string> = {
+  chenwenjun: "cwj",
+  gejunjie: "gjj",
+  kuangjungang: "kznb",
+  kuangzi: "kznb",
+  liyu: "lybb",
+  pipizhu: "ppz",
+  shenxinyu: "Sinyu",
+  tianchengzhuang: "ppz",
+  wangruizhi: "rz",
+  wuhaobing: "Hb",
+  xiongjiale: "jiale",
 };
 
 export default {
@@ -100,7 +83,7 @@ export default {
     ctx.waitUntil(handleScheduled(controller.cron, env));
   },
 
-  async fetch(request: Request, env: Env) {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
 
     if (url.pathname === "/") {
@@ -125,6 +108,10 @@ export default {
       assertAuthorized(request, env);
       const result = await sendBattleReport(env, { skipEmpty: false });
       return jsonResponse({ ok: true, type: "battle-report", result });
+    }
+
+    if (url.pathname === "/slack/record-match") {
+      return handleSlackRecordMatch(request, env, ctx);
     }
 
     return jsonResponse({ ok: false, error: "not_found" }, 404);
@@ -204,17 +191,16 @@ async function sendBattleReport(
   env: Env,
   options: { skipEmpty: boolean; idempotencyKey?: string },
 ) {
-  const state = await fetchState(env);
-  const { message, matchCount } = buildBattleReportMessage(state, shanghaiDateString());
+  const report = await fetchBattleReport(env, shanghaiDateString());
 
-  if (options.skipEmpty && matchCount === 0) {
+  if (options.skipEmpty && report.matchCount === 0) {
     console.log("No matches today; skipped battle report.");
-    return { skipped: true, matchCount };
+    return { skipped: true, matchCount: report.matchCount };
   }
 
   return options.idempotencyKey
-    ? postToSlackOnce(env, options.idempotencyKey, message)
-    : postToSlack(env, message);
+    ? postToSlackOnce(env, options.idempotencyKey, report.message)
+    : postToSlack(env, report.message);
 }
 
 async function buildReservationMessage(env: Env, dateSeed = shanghaiDateString()) {
@@ -269,6 +255,220 @@ async function fetchState(env: Env): Promise<AppState> {
   return response.json();
 }
 
+async function fetchBattleReport(env: Env, dateSeed: string): Promise<BattleReport> {
+  const url = new URL("/api/slack/battle-report", env.STATE_URL);
+  url.searchParams.set("date", dateSeed);
+
+  const response = await fetch(url, {
+    headers: {
+      accept: "application/json",
+      "user-agent": "billiards-slack-notifier/1.0",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`GET ${url} failed: HTTP ${response.status}`);
+  }
+
+  const report = await response.json<BattleReport>();
+  if (typeof report.message !== "string" || typeof report.matchCount !== "number") {
+    throw new Error(`GET ${url} returned invalid battle report`);
+  }
+
+  return report;
+}
+
+async function handleSlackRecordMatch(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+) {
+  if (request.method !== "POST") {
+    return textResponse("Method not allowed", 405);
+  }
+
+  const body = await request.text();
+  if (!(await verifySlackRequest(request, env, body))) {
+    return textResponse("Unauthorized", 401);
+  }
+
+  const form = new URLSearchParams(body);
+  const text = form.get("text")?.trim() || "";
+  const responseUrl = form.get("response_url") || "";
+  const channelId = form.get("channel_id") || "";
+  const recorder = formatSlackRecorder(
+    form.get("user_id") || "",
+    form.get("user_name") || "",
+  );
+
+  if (channelId !== env.SLACK_CHANNEL_ID) {
+    return textResponse("这个命令只能在指定台球频道使用。");
+  }
+
+  ctx.waitUntil(sendSlackRecordMatchResult(env, text, responseUrl, recorder));
+  return textResponse("正在记录比赛，稍后返回结果。");
+}
+
+async function sendSlackRecordMatchResult(
+  env: Env,
+  text: string,
+  responseUrl: string,
+  recorder: string,
+) {
+  let message: string;
+  try {
+    const result = await recordMatchFromSlackText(env, text);
+    message = `已记录：${result.winnerName} 胜 ${result.loserName}`;
+    try {
+      await postToSlack(
+        env,
+        `*比赛记录成功*\n记录人：${recorder}\n结果：${formatPlayerName(
+          result.winnerName,
+        )} 胜 ${formatPlayerName(result.loserName)}`,
+      );
+    } catch (error) {
+      console.log(
+        `Match recorded but Slack channel post failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      message = `${message}，但频道消息发送失败。`;
+    }
+  } catch (error) {
+    message = `记录失败：${error instanceof Error ? error.message : String(error)}`;
+  }
+
+  if (!responseUrl) {
+    console.log(message);
+    return;
+  }
+
+  await postSlackCommandResponse(responseUrl, message);
+}
+
+function formatSlackRecorder(userId: string, userName: string) {
+  if (userId) return `<@${userId}>`;
+  return userName ? `@${userName}` : "未知用户";
+}
+
+async function recordMatchFromSlackText(env: Env, text: string) {
+  const { winner, loser } = parseMatchCommand(text);
+  const state = await fetchState(env);
+  const winnerPlayer = resolvePlayer(state.players || [], winner);
+  const loserPlayer = resolvePlayer(state.players || [], loser);
+
+  if (winnerPlayer.id === loserPlayer.id) {
+    throw new Error("胜者和败者不能是同一个人。");
+  }
+
+  await createMatch(env, winnerPlayer.id, loserPlayer.id);
+  return {
+    winnerName: winnerPlayer.name,
+    loserName: loserPlayer.name,
+  };
+}
+
+function parseMatchCommand(text: string): ParsedMatchCommand {
+  const tokens = text
+    .replace(/[，,]/g, " ")
+    .replace(/\b(?:beat|beats|defeated|defeats|vs|v)\b/gi, " ")
+    .replace(/[胜赢]/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (tokens.length !== 2) {
+    throw new Error("用法：/record-match 胜者 败者，例如 /record-match cwj gjj。");
+  }
+
+  return { winner: tokens[0], loser: tokens[1] };
+}
+
+function resolvePlayer(players: Player[], token: string): Player {
+  const slackMention = token.match(/^<@([A-Z0-9]+)(?:\|[^>]+)?>$/);
+  const playerName = slackMention
+    ? Object.entries(PLAYER_SLACK_MENTIONS).find(
+        ([, userId]) => userId === slackMention[1],
+      )?.[0]
+    : token.replace(/^@/, "");
+  const normalizedName = playerName
+    ? PLAYER_ALIASES[playerName.toLowerCase()] || playerName.toLowerCase()
+    : undefined;
+  const matches = players.filter(
+    (player) => player.name.toLowerCase() === normalizedName,
+  );
+
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) throw new Error(`选手名不唯一：${playerName}`);
+  throw new Error(`找不到选手：${token}`);
+}
+
+async function createMatch(env: Env, winnerId: string, loserId: string) {
+  const url = new URL("/api/matches", env.STATE_URL);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      "user-agent": "billiards-slack-notifier/1.0",
+    },
+    body: JSON.stringify({
+      winnerId,
+      loserId,
+      winnerMoments: [],
+      loserMoments: [],
+      winnerNote: "",
+      loserNote: "",
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`POST ${url} failed: HTTP ${response.status}`);
+  }
+}
+
+async function postSlackCommandResponse(responseUrl: string, message: string) {
+  const response = await fetch(responseUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      response_type: "ephemeral",
+      text: message,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Slack response_url failed: HTTP ${response.status}`);
+  }
+}
+
+async function verifySlackRequest(request: Request, env: Env, body: string) {
+  if (!env.SLACK_SIGNING_SECRET) return false;
+
+  const timestamp = request.headers.get("x-slack-request-timestamp") || "";
+  const requestAgeSeconds = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (!Number.isFinite(requestAgeSeconds) || requestAgeSeconds > 300) return false;
+
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(env.SLACK_SIGNING_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    encoder.encode(`v0:${timestamp}:${body}`),
+  );
+  const expected = `v0=${hex(new Uint8Array(digest))}`;
+
+  return timingSafeEqual(expected, request.headers.get("x-slack-signature") || "");
+}
+
 function buildReservationOrder(players: Player[], dateSeed: string): ReservationEntry[] {
   const drawSeed = SPECIAL_DATE_SEEDS[dateSeed]
     ? `${dateSeed}|${SPECIAL_DATE_SEEDS[dateSeed]}`
@@ -299,191 +499,6 @@ function buildReservationOrder(players: Player[], dateSeed: string): Reservation
     .map((entry, index) => ({ ...entry, order: index + 1 }));
 }
 
-function buildBattleReportMessage(
-  state: AppState,
-  dateSeed: string,
-): { message: string; matchCount: number } {
-  const { start, end } = shanghaiDateBounds(dateSeed);
-  const timeline = buildMatchTimeline(state.players || [], state.matches || []);
-  const todayMatches = timeline.filter((match) => {
-    const createdAt = new Date(match.createdAt);
-    return createdAt >= start && createdAt < end;
-  });
-
-  const records = new Map(
-    (state.players || []).map((player) => [
-      player.name,
-      { name: player.name, wins: 0, losses: 0, delta: 0 },
-    ]),
-  );
-
-  for (const match of todayMatches) {
-    const winner = records.get(match.winnerName);
-    const loser = records.get(match.loserName);
-    if (winner) {
-      winner.wins += 1;
-      winner.delta += match.winnerDelta;
-    }
-    if (loser) {
-      loser.losses += 1;
-      loser.delta += match.loserDelta;
-    }
-  }
-
-  const activeRecords = [...records.values()]
-    .filter((record) => record.wins || record.losses)
-    .sort(
-      (left, right) =>
-        right.wins - left.wins ||
-        right.delta - left.delta ||
-        left.losses - right.losses ||
-        left.name.localeCompare(right.name),
-    );
-
-  const lines = [`*今日战报（${dateSeed}）*`, `今日共 ${todayMatches.length} 场`];
-
-  if (!todayMatches.length) {
-    lines.push("今天还没有录入比赛。");
-    return { message: lines.join("\n"), matchCount: todayMatches.length };
-  }
-
-  lines.push("", "*逐场结果*");
-  todayMatches.forEach((match, index) => {
-    lines.push(
-      `${index + 1}. ${timeLabel(match.createdAt)} ${formatPlayerName(
-        match.winnerName,
-      )} 胜 ${formatPlayerName(match.loserName)} ` +
-        `（${signed(match.winnerDelta)} / ${signed(match.loserDelta)}）` +
-        `${momentsText(match)}`,
-    );
-  });
-
-  lines.push("", "*今日胜负榜*");
-  activeRecords.forEach((record, index) => {
-    lines.push(
-      `${index + 1}. ${formatPlayerName(record.name)} ${record.wins}胜${
-        record.losses
-      }负，净积分 ${signed(record.delta)}`,
-    );
-  });
-
-  return { message: lines.join("\n"), matchCount: todayMatches.length };
-}
-
-function buildMatchTimeline(players: Player[], matches: MatchRecord[]): TimelineEntry[] {
-  let stats = createInitialStats(players);
-  let activeMonthKey = "";
-  const playerMap = Object.fromEntries(players.map((player) => [player.id, player]));
-
-  return [...matches]
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
-    .map((match) => {
-      const key = localMonthKey(match.createdAt);
-
-      if (key !== activeMonthKey) {
-        stats = createInitialStats(players);
-        activeMonthKey = key;
-      }
-
-      const winner = stats[match.winnerId];
-      const loser = stats[match.loserId];
-      const winnerPlayer = playerMap[match.winnerId];
-      const loserPlayer = playerMap[match.loserId];
-      if (!winner || !loser || !winnerPlayer || !loserPlayer) return null;
-
-      const winnerKFactor = getEffectiveKFactor(winner.wins + winner.losses);
-      const loserKFactor = getEffectiveKFactor(loser.wins + loser.losses);
-      const delta = calculateMatchDelta(
-        winner.rating,
-        loser.rating,
-        winnerKFactor,
-        loserKFactor,
-      );
-      const entry: TimelineEntry = {
-        ...match,
-        winnerName: winnerPlayer.name,
-        loserName: loserPlayer.name,
-        winnerDelta: delta.winnerDelta,
-        loserDelta: delta.loserDelta,
-        winnerRatingAfter: winner.rating + delta.winnerDelta,
-        loserRatingAfter: loser.rating + delta.loserDelta,
-      };
-
-      winner.rating += delta.winnerDelta;
-      winner.wins += 1;
-      loser.rating += delta.loserDelta;
-      loser.losses += 1;
-
-      return entry;
-    })
-    .filter((entry): entry is TimelineEntry => Boolean(entry));
-}
-
-function createInitialStats(players: Player[]) {
-  return Object.fromEntries(
-    players.map((player) => [
-      player.id,
-      {
-        rating: DEFAULT_RATING,
-        wins: 0,
-        losses: 0,
-      },
-    ]),
-  );
-}
-
-function getEffectiveKFactor(totalMatchesBefore: number) {
-  if (totalMatchesBefore < NEW_PLAYER_GAME_THRESHOLD) return NEW_PLAYER_K_FACTOR;
-  if (totalMatchesBefore >= STABLE_PLAYER_GAME_THRESHOLD) return STABLE_PLAYER_K_FACTOR;
-  return DEFAULT_K_FACTOR;
-}
-
-function calculateMatchDelta(
-  winnerRating: number,
-  loserRating: number,
-  winnerKFactor: number,
-  loserKFactor: number,
-) {
-  return {
-    winnerDelta: calculatePlayerDelta({
-      playerRating: winnerRating,
-      opponentRating: loserRating,
-      playerKFactor: winnerKFactor,
-      actualScore: 1,
-    }),
-    loserDelta: calculatePlayerDelta({
-      playerRating: loserRating,
-      opponentRating: winnerRating,
-      playerKFactor: loserKFactor,
-      actualScore: 0,
-    }),
-  };
-}
-
-function calculatePlayerDelta({
-  playerRating,
-  opponentRating,
-  playerKFactor,
-  actualScore,
-}: {
-  playerRating: number;
-  opponentRating: number;
-  playerKFactor: number;
-  actualScore: 0 | 1;
-}) {
-  const expectedScore = 1 / (1 + 10 ** ((opponentRating - playerRating) / 400));
-  const multiplier =
-    actualScore === 0 ? getLossPenaltyMultiplier(playerRating, opponentRating) : 1;
-  const rawDelta = playerKFactor * (actualScore - expectedScore) * multiplier;
-  return rawDelta < 0 ? -Math.round(Math.abs(rawDelta)) : Math.round(rawDelta);
-}
-
-function getLossPenaltyMultiplier(loserRating: number, winnerRating: number) {
-  const gap = loserRating - winnerRating;
-  const sigmoid = 1 / (1 + Math.exp(-gap / 400));
-  return 0.1 + sigmoid * 0.8;
-}
-
 function fnv1a32(input: string) {
   let hash = 0x811c9dc5;
   for (let index = 0; index < input.length; index += 1) {
@@ -498,35 +513,8 @@ function formatPlayerName(name: string) {
   return userId ? `${name} <@${userId}>` : name;
 }
 
-function signed(delta: number) {
-  return delta > 0 ? `+${delta}` : String(delta);
-}
-
-function momentsText(match: TimelineEntry) {
-  const bits = [];
-  for (const key of match.winnerMoments || []) {
-    bits.push(`${match.winnerName}：${MOMENT_LABELS[key] || key}`);
-  }
-  for (const key of match.loserMoments || []) {
-    bits.push(`${match.loserName}：${MOMENT_LABELS[key] || key}`);
-  }
-  return bits.length ? `（${bits.join("；")}）` : "";
-}
-
 function shanghaiDateString(date = new Date()) {
   return formatDateInTimeZone(date, "Asia/Shanghai");
-}
-
-function shanghaiDateBounds(dateSeed: string) {
-  const [year, month, day] = dateSeed.split("-").map(Number);
-  return {
-    start: new Date(Date.UTC(year, month - 1, day - 1, 16, 0, 0, 0)),
-    end: new Date(Date.UTC(year, month - 1, day, 16, 0, 0, 0)),
-  };
-}
-
-function localMonthKey(isoString: string) {
-  return formatDateInTimeZone(new Date(isoString), "Asia/Shanghai").slice(0, 7);
 }
 
 function formatDateInTimeZone(date: Date, timeZone: string) {
@@ -540,13 +528,21 @@ function formatDateInTimeZone(date: Date, timeZone: string) {
   return `${values.year}-${values.month}-${values.day}`;
 }
 
-function timeLabel(isoString: string) {
-  return new Intl.DateTimeFormat("zh-CN", {
-    timeZone: "Asia/Shanghai",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(new Date(isoString));
+function hex(bytes: Uint8Array) {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function timingSafeEqual(left: string, right: string) {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  let diff = leftBytes.length ^ rightBytes.length;
+  const length = Math.max(leftBytes.length, rightBytes.length);
+
+  for (let index = 0; index < length; index += 1) {
+    diff |= (leftBytes[index] || 0) ^ (rightBytes[index] || 0);
+  }
+
+  return diff === 0;
 }
 
 async function postToSlack(env: Env, message: string) {
@@ -599,6 +595,15 @@ function jsonResponse(body: unknown, status = 200) {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
+    },
+  });
+}
+
+function textResponse(body: string, status = 200) {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
     },
   });
 }
