@@ -392,7 +392,7 @@ function resolvePlayer(players: Player[], token: string): Player {
       )?.[0]
     : token.replace(/^@/, "");
   const normalizedName = playerName
-    ? PLAYER_ALIASES[playerName.toLowerCase()] || playerName.toLowerCase()
+    ? (PLAYER_ALIASES[playerName.toLowerCase()] || playerName).toLowerCase()
     : undefined;
   const matches = players.filter(
     (player) => player.name.toLowerCase() === normalizedName,
