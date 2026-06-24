@@ -16,6 +16,21 @@ type Player = {
 
 type AppState = {
   players?: Player[];
+  matches?: MatchRecord[];
+};
+
+type MatchRecord = {
+  id: string;
+  winnerId: string;
+  loserId: string;
+  createdAt: string;
+};
+
+type RatingDelta = {
+  winnerDelta: number;
+  loserDelta: number;
+  streakBreakerBonus?: number;
+  winStreakBonus?: number;
 };
 
 type ReservationEntry = {
@@ -37,6 +52,11 @@ type IdempotencyReserveResponse = {
 type BattleReport = {
   matchCount: number;
   message: string;
+  matches?: BattleReportMatch[];
+};
+
+type BattleReportMatch = RatingDelta & {
+  id: string;
 };
 
 type ParsedMatchCommand = {
@@ -318,13 +338,19 @@ async function sendSlackRecordMatchResult(
   let message: string;
   try {
     const result = await recordMatchFromSlackText(env, text);
-    message = `已记录：${result.winnerName} 胜 ${result.loserName}`;
+    message = `已记录：${result.winnerName}（${signed(
+      result.winnerDelta,
+    )}） 胜 ${result.loserName}（${signed(result.loserDelta)}）${formatBonusText(
+      result,
+    )}`;
     try {
       await postToSlack(
         env,
         `*比赛记录成功*\n记录人：${recorder}\n结果：${formatPlayerName(
           result.winnerName,
-        )} 胜 ${formatPlayerName(result.loserName)}`,
+        )}（${signed(result.winnerDelta)}） 胜 ${formatPlayerName(
+          result.loserName,
+        )}（${signed(result.loserDelta)}）${formatBonusText(result)}`,
       );
     } catch (error) {
       console.log(
@@ -361,10 +387,15 @@ async function recordMatchFromSlackText(env: Env, text: string) {
     throw new Error("胜者和败者不能是同一个人。");
   }
 
-  await createMatch(env, winnerPlayer.id, loserPlayer.id);
+  const nextState = await createMatch(env, winnerPlayer.id, loserPlayer.id);
+  const createdMatch = findLatestMatch(nextState, winnerPlayer.id, loserPlayer.id);
+  const delta = createdMatch
+    ? await fetchRecordedMatchDelta(env, createdMatch)
+    : { winnerDelta: 0, loserDelta: 0 };
   return {
     winnerName: winnerPlayer.name,
     loserName: loserPlayer.name,
+    ...delta,
   };
 }
 
@@ -403,6 +434,25 @@ function resolvePlayer(players: Player[], token: string): Player {
   throw new Error(`找不到选手：${token}`);
 }
 
+function findLatestMatch(
+  state: AppState,
+  winnerId: string,
+  loserId: string,
+): MatchRecord | undefined {
+  return [...(state.matches || [])]
+    .reverse()
+    .find((match) => match.winnerId === winnerId && match.loserId === loserId);
+}
+
+async function fetchRecordedMatchDelta(
+  env: Env,
+  match: MatchRecord,
+): Promise<RatingDelta> {
+  const report = await fetchBattleReport(env, shanghaiDateString(new Date(match.createdAt)));
+  const reportedMatch = report.matches?.find((entry) => entry.id === match.id);
+  return reportedMatch || { winnerDelta: 0, loserDelta: 0 };
+}
+
 async function createMatch(env: Env, winnerId: string, loserId: string) {
   const url = new URL("/api/matches", env.STATE_URL);
   const response = await fetch(url, {
@@ -425,6 +475,8 @@ async function createMatch(env: Env, winnerId: string, loserId: string) {
   if (!response.ok) {
     throw new Error(`POST ${url} failed: HTTP ${response.status}`);
   }
+
+  return response.json<AppState>();
 }
 
 async function postSlackCommandResponse(responseUrl: string, message: string) {
@@ -511,6 +563,21 @@ function fnv1a32(input: string) {
 function formatPlayerName(name: string) {
   const userId = PLAYER_SLACK_MENTIONS[name];
   return userId ? `${name} <@${userId}>` : name;
+}
+
+function signed(delta: number) {
+  return delta > 0 ? `+${delta}` : String(delta);
+}
+
+function formatBonusText(delta: RatingDelta) {
+  const bits = [];
+  if (delta.streakBreakerBonus) {
+    bits.push(`终结连胜奖励 ${signed(delta.streakBreakerBonus)}`);
+  }
+  if (delta.winStreakBonus) {
+    bits.push(`连胜延续奖励 ${signed(delta.winStreakBonus)}`);
+  }
+  return bits.length ? `，含${bits.join("，")}` : "";
 }
 
 function mentionPlayerNames(message: string) {
