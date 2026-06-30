@@ -35,13 +35,20 @@ type RatingDelta = {
 
 type ReservationEntry = {
   order: number;
-  id: string;
+  playerId: string;
   name: string;
-  createdAt: string;
   drawNumber: number;
   drawNumberLabel: string;
+  slackUserId?: string;
+};
+
+type ReservationOrder = {
   dateSeed: string;
   drawSeed: string;
+  timezone: string;
+  algorithm: string;
+  generatedAt: string;
+  entries: ReservationEntry[];
 };
 
 type IdempotencyReserveResponse = {
@@ -66,10 +73,6 @@ type ParsedMatchCommand = {
 
 const RESERVATION_CRON = "0 9 * * 2-6";
 const BATTLE_REPORT_CRON = "30 11 * * 2-6";
-
-const SPECIAL_DATE_SEEDS: Record<string, string> = {
-  "2026-06-01": "reset-6",
-};
 
 const PLAYER_SLACK_MENTIONS: Record<string, string> = {
   cwj: "U02KGJZPZ19",
@@ -224,16 +227,15 @@ async function sendBattleReport(
 }
 
 async function buildReservationMessage(env: Env, dateSeed = shanghaiDateString()) {
-  const state = await fetchState(env);
-  const entries = buildReservationOrder(state.players || [], dateSeed);
+  const order = await fetchReservationOrder(env, dateSeed);
 
   return [
-    `*今日台球预约每日排序（${dateSeed}）*`,
-    `参与球员：${entries.length} 人`,
+    `*今日台球预约每日排序（${order.dateSeed}）*`,
+    `参与球员：${order.entries.length} 人`,
     "",
-    ...entries.map(
+    ...order.entries.map(
       (entry) =>
-        `${entry.order}. ${formatPlayerName(entry.name)} \`${entry.drawNumberLabel}\``,
+        `${entry.order}. ${formatReservationPlayerName(entry)} \`${entry.drawNumberLabel}\``,
     ),
   ].join("\n");
 }
@@ -273,6 +275,32 @@ async function fetchState(env: Env): Promise<AppState> {
   }
 
   return response.json();
+}
+
+async function fetchReservationOrder(
+  env: Env,
+  dateSeed: string,
+): Promise<ReservationOrder> {
+  const url = new URL("/api/reservation-order", env.STATE_URL);
+  url.searchParams.set("date", dateSeed);
+
+  const response = await fetch(url, {
+    headers: {
+      accept: "application/json",
+      "user-agent": "billiards-slack-notifier/1.0",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`GET ${url} failed: HTTP ${response.status}`);
+  }
+
+  const order = await response.json<ReservationOrder>();
+  if (typeof order.dateSeed !== "string" || !Array.isArray(order.entries)) {
+    throw new Error(`GET ${url} returned invalid reservation order`);
+  }
+
+  return order;
 }
 
 async function fetchBattleReport(env: Env, dateSeed: string): Promise<BattleReport> {
@@ -521,48 +549,14 @@ async function verifySlackRequest(request: Request, env: Env, body: string) {
   return timingSafeEqual(expected, request.headers.get("x-slack-signature") || "");
 }
 
-function buildReservationOrder(players: Player[], dateSeed: string): ReservationEntry[] {
-  const drawSeed = SPECIAL_DATE_SEEDS[dateSeed]
-    ? `${dateSeed}|${SPECIAL_DATE_SEEDS[dateSeed]}`
-    : dateSeed;
-
-  return players
-    .filter((player) => player.isActive)
-    .map((player) => {
-      const hashInput = `${drawSeed}|${player.id}|${player.name}|${player.createdAt}`;
-      const drawNumber = fnv1a32(hashInput);
-      return {
-        order: 0,
-        id: player.id,
-        name: player.name,
-        createdAt: player.createdAt,
-        drawNumber,
-        drawNumberLabel: drawNumber.toString(16).toUpperCase().padStart(8, "0"),
-        dateSeed,
-        drawSeed,
-      };
-    })
-    .sort((left, right) => {
-      if (left.drawNumber !== right.drawNumber) return left.drawNumber - right.drawNumber;
-      const createdAtOrder = left.createdAt.localeCompare(right.createdAt);
-      if (createdAtOrder !== 0) return createdAtOrder;
-      return left.id.localeCompare(right.id);
-    })
-    .map((entry, index) => ({ ...entry, order: index + 1 }));
-}
-
-function fnv1a32(input: string) {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < input.length; index += 1) {
-    hash ^= input.charCodeAt(index);
-    hash = Math.imul(hash, 0x1000193);
-  }
-  return hash >>> 0;
-}
-
 function formatPlayerName(name: string) {
   const userId = PLAYER_SLACK_MENTIONS[name];
   return userId ? `${name} <@${userId}>` : name;
+}
+
+function formatReservationPlayerName(entry: ReservationEntry) {
+  const userId = entry.slackUserId || PLAYER_SLACK_MENTIONS[entry.name];
+  return userId ? `${entry.name} <@${userId}>` : entry.name;
 }
 
 function signed(delta: number) {
